@@ -1,2 +1,4 @@
 node_modules/
 *.tgz
+# private on-board notes, never publish
+docs/

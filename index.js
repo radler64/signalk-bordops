@@ -230,6 +230,12 @@ module.exports = function (app) {
         return; // keep the queue; the token may get fixed
       }
 
+      if (res.status === 404) {
+        stats.lastError = `boat '${options.boatCode}' not found (HTTP 404) — check boat code`;
+        app.setPluginError(stats.lastError);
+        return; // keep the queue; the code may get fixed
+      }
+
       if (!res.ok && res.status !== 422) {
         stats.lastError = `HTTP ${res.status}`;
         status();
@@ -292,6 +298,11 @@ module.exports = function (app) {
       },
       options || {}
     );
+
+    // tolerate copy-paste whitespace around code / token / URL
+    options.boatCode = String(options.boatCode || '').trim();
+    options.token = String(options.token || '').trim();
+    options.serverUrl = String(options.serverUrl || '').trim();
 
     if (!options.boatCode || !options.token) {
       app.setPluginError('Boat code and API token are required — see plugin settings.');

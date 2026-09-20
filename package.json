@@ -1,6 +1,6 @@
 {
   "name": "signalk-bordops",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Send your vessel's position from Signal K to BordOps (bordops.eu) - adaptive sampling, offline buffering, batch upload.",
   "main": "index.js",
   "license": "MIT",
@@ -19,5 +19,14 @@
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {}
+  "dependencies": {},
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "homepage": "https://bordops.eu",
+  "bugs": {
+    "url": "https://github.com/radler64/signalk-bordops/issues"
+  }
 }
