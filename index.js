@@ -33,7 +33,7 @@ module.exports = function (app) {
   let queueFile = null;
   let dirtySinceSave = 0;
   let lastSent = null; // { time: ms, lat, lon, heading }
-  let stats = { queued: 0, uploaded: 0, rejected: 0, lastError: null };
+  let stats = { queued: 0, uploaded: 0, rejected: 0, lastError: null, lastUpload: null, lastReject: null };
 
   plugin.id = 'signalk-bordops';
   plugin.name = 'BordOps Position Reporter';
@@ -151,10 +151,15 @@ module.exports = function (app) {
   }
 
   function status() {
-    const err = stats.lastError ? ` — last error: ${stats.lastError}` : '';
-    app.setPluginStatus(
-      `queued ${queue.length}, uploaded ${stats.uploaded}, rejected ${stats.rejected}${err}`
-    );
+    const parts = [`queued ${queue.length}`, `uploaded ${stats.uploaded}`];
+    if (stats.lastUpload) parts.push(`last ${stats.lastUpload.slice(11, 19)}Z`);
+    if (stats.rejected) {
+      parts.push(`rejected ${stats.rejected}` + (stats.lastReject ? ` (${stats.lastReject})` : ''));
+    }
+    if (stats.lastError) parts.push(`error: ${stats.lastError}`);
+    const msg = parts.join(', ');
+    // setPluginError paints the dashboard entry red; keep it for real errors only
+    stats.lastError ? app.setPluginError(msg) : app.setPluginStatus(msg);
   }
 
   // ---------------------------------------------------------------- sampling
@@ -257,9 +262,12 @@ module.exports = function (app) {
       }
 
       const accepted = new Set(body.accepted || []);
-      const rejected = new Set(
-        (body.rejected || []).map((r) => r.idempotency_key)
-      );
+      const rejectedList = body.rejected || [];
+      const rejected = new Set(rejectedList.map((r) => r.idempotency_key));
+      if (rejectedList.length) {
+        stats.lastReject = String(rejectedList[0].reason || 'no reason').slice(0, 60);
+        app.debug('rejected %d: %j', rejectedList.length, rejectedList.slice(0, 3));
+      }
 
       // Drop everything the server decided on (accepted or rejected) —
       // a rejected point (implausible/out of range) will not get better
@@ -269,6 +277,7 @@ module.exports = function (app) {
 
       stats.uploaded += accepted.size;
       stats.rejected += rejected.size;
+      if (accepted.size) stats.lastUpload = new Date().toISOString();
       stats.lastError = null;
       saveQueue(true);
       status();
