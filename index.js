@@ -16,14 +16,21 @@
  *  - Response: { accepted: [keys], rejected: [{idempotency_key, reason}] }
  *  - Per boat+timestamp exactly one point is stored server-side, so
  *    retries with the same recorded_at are always safe.
+ *
+ * Alarms (since 0.2.0): state changes of selected notifications.* paths go
+ * to …/alarms/batch right away (own disk queue, backoff), plus a heartbeat
+ * every 5 min for the server's connection watch. Logic in lib/alarms.js.
  */
 
 const fs = require('fs');
 const path = require('path');
+const alarms = require('./lib/alarms');
 
+const VERSION = require('./package.json').version;
 const MS_TO_KNOTS = 1.9438444924;
 const RAD_TO_DEG = 180 / Math.PI;
 const BATCH_LIMIT = 500; // server-side maximum per request
+const REQUEST_TIMEOUT_MS = 20000; // alarm requests only
 
 module.exports = function (app) {
   const plugin = {};
@@ -34,11 +41,12 @@ module.exports = function (app) {
   let dirtySinceSave = 0;
   let lastSent = null; // { time: ms, lat, lon, heading }
   let stats = { queued: 0, uploaded: 0, rejected: 0, lastError: null, lastUpload: null, lastReject: null };
+  let al = null; // alarm forwarding state, null while not running
 
   plugin.id = 'signalk-bordops';
-  plugin.name = 'BordOps Position Reporter';
+  plugin.name = 'BordOps Position & Alarm Reporter';
   plugin.description =
-    'Sends the vessel position to BordOps (bordops.eu) with adaptive sampling and offline buffering.';
+    'Sends the vessel position (adaptive sampling, offline buffering) and alarms (Signal K notifications) to BordOps (bordops.eu).';
 
   plugin.schema = {
     type: 'object',
@@ -99,6 +107,40 @@ module.exports = function (app) {
           'Oldest points are dropped beyond this limit (~3 weeks at max interval).',
         default: 20000,
       },
+      alarms: {
+        type: 'object',
+        title: 'Alarms',
+        description:
+          'Forward Signal K notifications to the BordOps alarm centre (web push). The token needs boat:<code>:alarms:write.',
+        properties: {
+          enabled: { type: 'boolean', title: 'Forward alarms', default: true },
+          paths: {
+            type: 'string',
+            title: 'Notification paths (prefixes, comma-separated)',
+            description: 'notifications.bordops.test is always forwarded.',
+            default: alarms.DEFAULT_PATHS,
+          },
+          minState: {
+            type: 'string',
+            title: 'Minimum state',
+            description: 'Lower states are only sent to close an alarm reported before.',
+            enum: ['alert', 'warn', 'alarm', 'emergency'],
+            default: 'alert',
+          },
+          updateSeconds: {
+            type: 'number',
+            title: 'Text update interval (s)',
+            description: 'In alarm/emergency, send a changed text at most this often (0 = off).',
+            default: 120,
+          },
+          heartbeatSeconds: {
+            type: 'number',
+            title: 'Heartbeat interval (s)',
+            description: 'BordOps raises "no data from the boat" when heartbeats stop while the anchor watch is on.',
+            default: 300,
+          },
+        },
+      },
     },
   };
 
@@ -157,9 +199,40 @@ module.exports = function (app) {
       parts.push(`rejected ${stats.rejected}` + (stats.lastReject ? ` (${stats.lastReject})` : ''));
     }
     if (stats.lastError) parts.push(`error: ${stats.lastError}`);
-    const msg = parts.join(', ');
+    const msg = `${parts.join(', ')} · ${alarmStatus()}`;
     // setPluginError paints the dashboard entry red; keep it for real errors only
-    stats.lastError ? app.setPluginError(msg) : app.setPluginStatus(msg);
+    const failed = stats.lastError || (al && (al.stats.error || al.stats.hbError));
+    failed ? app.setPluginError(msg) : app.setPluginStatus(msg);
+  }
+
+  function alarmStatus() {
+    if (!al) return 'alarms off';
+    const s = al.stats;
+    const parts = [`alarms: ${s.sent} sent`];
+    if (s.lastSent) parts.push(`last ${s.lastSent.slice(11, 19)}Z`);
+    parts.push(`queue ${al.queue.length}`);
+    if (s.rejected) parts.push(`rejected ${s.rejected}` + (s.lastReject ? ` (${s.lastReject})` : ''));
+    if (s.error) parts.push(`error: ${s.error}`);
+    if (s.hbError && s.hbError !== s.error) parts.push(`heartbeat: ${s.hbError}`);
+    return parts.join(', ');
+  }
+
+  function readJson(file, fallback) {
+    try {
+      return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : fallback;
+    } catch (e) {
+      app.debug(`Could not read ${path.basename(file)}: ${e.message}`);
+      return fallback;
+    }
+  }
+
+  function writeJson(file, data) {
+    try {
+      fs.writeFileSync(file + '.tmp', JSON.stringify(data));
+      fs.renameSync(file + '.tmp', file); // never leave a torn file after a power cut
+    } catch (e) {
+      app.debug(`Could not write ${path.basename(file)}: ${e.message}`);
+    }
   }
 
   // ---------------------------------------------------------------- sampling
@@ -292,6 +365,206 @@ module.exports = function (app) {
     }
   }
 
+  // ---------------------------------------------------------------- alarms
+
+  const getSelf = (p) => app.getSelfPath(p);
+
+  function startAlarms(options) {
+    const o = Object.assign(
+      { enabled: true, paths: alarms.DEFAULT_PATHS, minState: 'alert', updateSeconds: 120, heartbeatSeconds: 300 },
+      options.alarms || {}
+    );
+    if (!o.enabled) return;
+    const minState = alarms.normState(o.minState);
+    o.minState = minState && minState !== 'normal' ? minState : 'alert';
+    o.updateSeconds = Math.max(0, Number(o.updateSeconds) || 0);
+    o.heartbeatSeconds = Math.max(60, Number(o.heartbeatSeconds) || 300);
+
+    const dir = app.getDataDirPath();
+    al = {
+      opts: o,
+      base:
+        options.serverUrl.replace(/\/+$/, '') +
+        `/api/v1/boats/${encodeURIComponent(options.boatCode)}/alarms/`,
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Authorization: `Bearer ${options.token}`,
+      },
+      boatCode: options.boatCode,
+      prefixes: alarms.parsePaths(o.paths),
+      queueFile: path.join(dir, 'bordops-alarm-queue.json'),
+      stateFile: path.join(dir, 'bordops-alarm-state.json'),
+      sources: {}, // path -> { sourceRef -> { state, message, ts } }
+      deferred: {}, // path -> throttled text-update timer
+      retryTimer: null,
+      attempt: 0,
+      busy: false,
+      stats: { sent: 0, rejected: 0, lastSent: null, lastReject: null, error: null, hbError: null },
+    };
+    const q = readJson(al.queueFile, []);
+    const sent = readJson(al.stateFile, {});
+    al.queue = alarms.prune(Array.isArray(q) ? q : [], Date.now());
+    al.sent = sent && typeof sent === 'object' ? sent : {}; // path -> last queued { state, message, ts, sentAt }
+
+    // Values Signal K already holds: wetterwacht publishes a level only on change,
+    // so an alarm raised before this start would otherwise never reach BordOps.
+    for (const n of alarms.collect(app.getSelfPath('notifications'))) onNotification(n.path, n.source, n);
+    unsubscribes.push(
+      app.streambundle.getSelfBus().onValue((v) => {
+        if (!v || v.isMeta || typeof v.path !== 'string' || !v.path.startsWith('notifications.')) return;
+        const n = alarms.toNotification(v.value, v.timestamp);
+        if (n) onNotification(v.path, v.$source, n);
+      })
+    );
+
+    al.heartbeatTimer = setInterval(sendHeartbeat, o.heartbeatSeconds * 1000);
+    sendHeartbeat();
+    flushAlarms(true);
+  }
+
+  function stopAlarms() {
+    if (!al) return;
+    clearInterval(al.heartbeatTimer);
+    clearTimeout(al.retryTimer);
+    Object.values(al.deferred).forEach(clearTimeout);
+    writeJson(al.queueFile, al.queue);
+    al = null;
+  }
+
+  function onNotification(p, source, n) {
+    if (!alarms.matches(p, al.prefixes)) return;
+    (al.sources[p] = al.sources[p] || {})[source || 'unknown'] = n;
+    evaluateAlarm(p);
+  }
+
+  function evaluateAlarm(p) {
+    const cur = alarms.effective(al.sources[p]);
+    clearTimeout(al.deferred[p]);
+    delete al.deferred[p];
+    const d = cur && alarms.decide(al.sent[p], cur, al.opts, Date.now());
+    if (!d) return;
+    if (d.waitMs) al.deferred[p] = setTimeout(() => al && evaluateAlarm(p), d.waitMs);
+    else queueAlarm(p, cur, d.kind);
+  }
+
+  function queueAlarm(p, n, kind) {
+    const now = Date.now();
+    al.queue = alarms.prune(al.queue.concat(alarms.buildEvent(p, n, kind, getSelf, now)), now);
+    al.sent[p] = { state: n.state, message: n.message, ts: n.ts, sentAt: now };
+    writeJson(al.queueFile, al.queue);
+    writeJson(al.stateFile, al.sent);
+    app.debug('alarm %s %s → %s', kind, p, n.state);
+    flushAlarms(true);
+  }
+
+  // Sends right away; on failure retries after 5 s, 15 s, 30 s, then every minute.
+  // A new event cuts a pending wait short.
+  async function flushAlarms(immediate) {
+    const run = al;
+    if (!run) return;
+    if (immediate && run.retryTimer) {
+      clearTimeout(run.retryTimer);
+      run.retryTimer = null;
+    }
+    if (run.busy || run.retryTimer || run.queue.length === 0) return;
+
+    run.busy = true;
+    const batch = run.queue.slice(0, alarms.BATCH_MAX);
+    let r;
+    try {
+      const res = await fetch(run.base + 'batch', {
+        method: 'POST',
+        headers: run.headers,
+        body: JSON.stringify({ events: batch }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      r = alarms.batchResult(batch, res.status, await res.json().catch(() => null), run.boatCode);
+    } catch (e) {
+      r = { retry: true, error: `offline (${e.message})` };
+    }
+    run.busy = false;
+    if (al !== run) return; // stopped meanwhile; the server dedupes a resend by event_id
+
+    const s = run.stats;
+    s.error = r.error;
+    if (r.retry) {
+      run.retryTimer = setTimeout(() => {
+        run.retryTimer = null;
+        flushAlarms();
+      }, alarms.backoffMs(run.attempt++));
+    } else {
+      const done = new Set(r.remove);
+      run.queue = run.queue.filter((e) => !done.has(e.event_id));
+      run.attempt = 0;
+      s.sent += r.accepted;
+      if (r.accepted) s.lastSent = new Date().toISOString();
+      if (r.rejected.length) {
+        s.rejected += r.rejected.length;
+        s.lastReject = String(r.rejected[0].reason || 'no reason').slice(0, 60);
+        app.debug('alarm events rejected: %j', r.rejected.slice(0, 3));
+      }
+      writeJson(run.queueFile, run.queue);
+      if (run.queue.length) setImmediate(flushAlarms);
+    }
+    status();
+  }
+
+  // Live only, never buffered: BordOps counts heartbeats by their arrival time.
+  async function sendHeartbeat() {
+    const run = al;
+    if (!run) return;
+    const body = {
+      at: new Date().toISOString(),
+      watches: alarms.watches(getSelf, Date.now()),
+      plugin_version: VERSION,
+    };
+    try {
+      const res = await fetch(run.base + 'heartbeat', {
+        method: 'POST',
+        headers: run.headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      run.stats.hbError = res.ok
+        ? null
+        : alarms.httpError(res.status, await res.json().catch(() => null), run.boatCode);
+    } catch (e) {
+      run.stats.hbError = `offline (${e.message})`;
+    }
+    if (al === run) status();
+  }
+
+  plugin.registerWithRouter = function (router) {
+    // Test without a real alarm: sets notifications.bordops.test, which then
+    // travels the same way as any other notification.
+    router.post('/test-alarm', (req, res) => {
+      const body = req.body || {};
+      const state = alarms.normState(body.state || 'alarm');
+      if (!state) return res.status(400).json({ error: 'state: normal, alert, warn, alarm or emergency' });
+      if (!al) return res.status(503).json({ error: 'alarm forwarding is not running (plugin or alarms disabled)' });
+      const message =
+        typeof body.message === 'string' && body.message
+          ? body.message.slice(0, 200)
+          : state === 'normal'
+            ? 'Testalarm beendet'
+            : `Testalarm (${state}) von signalk-bordops`;
+      app.handleMessage(plugin.id, {
+        updates: [
+          {
+            values: [
+              {
+                path: alarms.TEST_PATH,
+                value: { state, method: state === 'normal' ? [] : ['visual'], message },
+              },
+            ],
+          },
+        ],
+      });
+      res.json({ path: alarms.TEST_PATH, state, message });
+    });
+  };
+
   // ---------------------------------------------------------------- lifecycle
 
   plugin.start = function (options) {
@@ -336,6 +609,7 @@ module.exports = function (app) {
       Math.max(10, options.uploadIntervalSeconds) * 1000
     );
 
+    startAlarms(options);
     status();
     app.debug('signalk-bordops started');
   };
@@ -347,6 +621,7 @@ module.exports = function (app) {
       clearInterval(uploadTimer);
       uploadTimer = null;
     }
+    stopAlarms();
     saveQueue(true);
     lastSent = null;
     app.debug('signalk-bordops stopped');

@@ -1,15 +1,20 @@
 {
   "name": "signalk-bordops",
-  "version": "0.1.2",
-  "description": "Send your vessel's position from Signal K to BordOps (bordops.eu) - adaptive sampling, offline buffering, batch upload.",
+  "version": "0.2.0",
+  "description": "Send your vessel's position and alarms from Signal K to BordOps (bordops.eu) - adaptive sampling, offline buffering, batch upload, web push alarms.",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "license": "MIT",
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-category-cloud",
+    "signalk-category-notifications",
     "bordops",
     "position",
-    "tracking"
+    "tracking",
+    "alarm"
   ],
   "author": "S4U GmbH (https://bordops.eu)",
   "repository": {
@@ -22,6 +27,7 @@
   "dependencies": {},
   "files": [
     "index.js",
+    "lib/",
     "README.md",
     "LICENSE"
   ],
